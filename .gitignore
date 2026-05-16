@@ -1,0 +1,6 @@
+# Build output
+neko
+
+# Odin build artifacts
+*.o
+*.obj
