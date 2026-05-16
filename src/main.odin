@@ -1,5 +1,5 @@
 // neko — a desktop cat pet for Wayland (Niri)
-// Phase 5: Fullscreen overlay with cat AI and movement
+// Phase 5+: Fullscreen overlay with cat AI, direction sprites, signal handling
 package neko
 
 import wl "../deps/odin-wayland"
@@ -60,9 +60,10 @@ State :: struct {
 	running:       bool,
 	closed:        bool,
 
-	// Sprites
+	// Sprites — one per direction for walking
 	idle_frame:    Sprite_Frame,
-	walk_frames:   [2]Sprite_Frame,
+	walk_right:    Sprite_Frame,   // walk1.png — facing right
+	walk_left:     Sprite_Frame,   // walk2.png — facing left
 	sleep_frame:   Sprite_Frame,
 
 	// Animation state
@@ -81,6 +82,19 @@ State :: struct {
 
 state: State
 global_context: runtime.Context
+
+// --- Signal handling ---
+// Catches SIGINT (Ctrl+C) and SIGTERM (kill) for clean shutdown.
+// The handler just sets running=false; the event loop exits naturally.
+
+signal_handler :: proc "c" (sig: posix.Signal) {
+	state.running = false
+}
+
+install_signal_handlers :: proc() {
+	posix.signal(.SIGINT,  signal_handler)
+	posix.signal(.SIGTERM, signal_handler)
+}
 
 // --- Sprite loading ---
 
@@ -135,15 +149,15 @@ load_all_sprites :: proc() -> bool {
 	state.idle_frame, ok = load_sprite("assets/sprites/idle.png")
 	if !ok do return false
 
-	state.walk_frames[0], ok = load_sprite("assets/sprites/walk1.png")
+	state.walk_right, ok = load_sprite("assets/sprites/walk1.png")  // facing right
 	if !ok do return false
-	state.walk_frames[1], ok = load_sprite("assets/sprites/walk2.png")
+	state.walk_left, ok = load_sprite("assets/sprites/walk2.png")   // facing left
 	if !ok do return false
 
 	state.sleep_frame, ok = load_sprite("assets/sprites/sleep.png")
 	if !ok do return false
 
-	fmt.println("  ✓ all sprites loaded (idle, walk×2, sleep)")
+	fmt.println("  ✓ all sprites loaded (idle, walk_right, walk_left, sleep)")
 	return true
 }
 
@@ -333,7 +347,13 @@ update_cat :: proc() {
 get_current_sprite :: proc() -> ^Sprite_Frame {
 	switch state.cat_state {
 	case .Idle:     return &state.idle_frame
-	case .Walking:  return &state.walk_frames[state.anim_frame % 2]
+	case .Walking:
+		// Pick sprite based on direction
+		if state.cat_dir > 0 {
+			return &state.walk_right
+		} else {
+			return &state.walk_left
+		}
 	case .Sleeping: return &state.sleep_frame
 	}
 	return &state.idle_frame
@@ -346,20 +366,18 @@ draw_frame :: proc() {
 	// Clear old sprite position to transparent
 	clear_rect(state.prev_x, state.prev_y)
 
-	// Blit the current sprite at the cat's position
+	// Blit the current sprite at the cat's position.
+	// No flipping needed — walk_right and walk_left are separate sprites.
 	sprite := get_current_sprite()
-	flip := state.cat_dir < 0  // flip horizontally when walking left
 
 	for sy in 0..<SPRITE_SIZE {
 		for sx in 0..<SPRITE_SIZE {
 			pixel := sprite.pixels[sy * SPRITE_SIZE + sx]
 			if pixel == 0 do continue  // skip fully transparent
 
-			// Flip horizontally if needed
-			dx := state.cat_x + (flip ? (SPRITE_SIZE - 1 - sx) : sx)
+			dx := state.cat_x + sx
 			dy := state.cat_y + sy
 
-			// Bounds check
 			if dx >= 0 && dx < sw && dy >= 0 && dy < sh {
 				state.buf_data[dy * sw + dx] = pixel
 			}
@@ -439,6 +457,9 @@ main :: proc() {
 		return
 	}
 
+	// Install signal handlers for clean shutdown (Ctrl+C, kill)
+	install_signal_handlers()
+
 	// Initialize cat
 	state.cat_state = .Idle
 	state.cat_dir = 1
@@ -494,16 +515,22 @@ main :: proc() {
 	wl.surface_commit(state.wl_surface)
 	fmt.println("✓ waiting for configure...")
 
-	// Event loop
+	// Event loop — wl_display_dispatch blocks until events arrive.
+	// A signal (SIGINT/SIGTERM) interrupts the syscall (EINTR), dispatch
+	// returns -1, and we check state.running to exit cleanly.
 	state.running = true
 	for state.running {
 		if wl.display_dispatch(state.display) < 0 {
+			if !state.running {
+				break  // signal received — clean exit
+			}
 			fmt.eprintln("error: display_dispatch failed")
 			break
 		}
 	}
 
 	// Cleanup
+	fmt.println("\nshutting down...")
 	if state.buffer != nil do wl.buffer_destroy(state.buffer)
 	if state.buf_data != nil {
 		linux.munmap(state.buf_data, uint(state.screen_w * state.screen_h * 4))
@@ -513,8 +540,8 @@ main :: proc() {
 	wl.surface_destroy(state.wl_surface)
 
 	delete(state.idle_frame.pixels)
-	delete(state.walk_frames[0].pixels)
-	delete(state.walk_frames[1].pixels)
+	delete(state.walk_right.pixels)
+	delete(state.walk_left.pixels)
 	delete(state.sleep_frame.pixels)
 
 	fmt.println("✓ neko exited cleanly")
