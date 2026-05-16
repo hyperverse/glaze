@@ -1,124 +1,126 @@
-# neko — Architecture Guide
+# Architecture Guide
 
-A walkthrough of `src/main.odin` and `protocols/wlr_layer_shell.odin` for anyone wanting to understand or extend the code.
+A walkthrough of the codebase for anyone wanting to understand or extend it.
 
 ---
 
-## High-Level Flow
+## Project Layout
 
 ```
-main()
-  ├── load_all_sprites()         ← load PNGs, chroma key, premultiply
-  ├── install_signal_handlers()  ← SIGINT/SIGTERM → clean exit
-  ├── wl_display_connect()       ← connect to Wayland compositor
-  ├── registry → bind globals    ← compositor, shm, layer_shell, output
-  ├── create wl_surface          ← the drawable surface
-  ├── set empty input region     ← click-through (mouse passes to windows below)
-  ├── create layer_surface       ← fullscreen transparent overlay
-  ├── wl_surface.commit()        ← triggers configure event
-  └── event loop                 ← wl_display_dispatch() in a loop
-        └── frame_done()         ← called ~60fps by compositor
-              ├── update_cat()   ← state machine tick (every 250ms)
-              ├── draw_frame()   ← clear old pos, blit sprite at new pos
-              └── commit         ← push new buffer to compositor
+overlay/                 ← shared framework package
+├── overlay.odin         ← Wayland lifecycle, EGL init, frame loop
+└── egl.odin             ← minimal EGL FFI bindings
+
+neko/                    ← desktop cat app
+└── main.odin            ← cat AI, sprites, GL setup, drawing
+
+protocols/               ← hand-written Wayland protocol bindings
+└── wlr_layer_shell.odin ← zwlr_layer_shell_v1 + zwlr_layer_surface_v1
+
+deps/odin-wayland/       ← vendored Wayland client bindings (git submodule)
 ```
 
 ---
 
-## Module Responsibilities
+## The Overlay Framework (`overlay/`)
 
-### `src/main.odin` — everything in one file (for now)
+The framework handles everything needed to create a fullscreen, transparent, click-through, GPU-rendered overlay on Wayland. Apps just provide 4 callbacks.
 
-The file is organized top-to-bottom in dependency order:
+### App Interface
 
-| Section | Lines | Purpose |
-|---------|-------|---------|
-| **Constants** | top | `SPRITE_SIZE`, timing, chroma key settings |
-| **Types** | after constants | `Sprite_Frame`, `Cat_State` enum, `State` struct |
-| **Global state** | `state`, `global_context` | Single global — intentional for Wayland C callbacks |
-| **Signal handling** | `signal_handler`, `install_signal_handlers` | POSIX signal → `state.running = false` |
-| **Sprite loading** | `load_sprite`, `load_all_sprites` | stb_image → chroma key → premultiplied ARGB8888 |
-| **Registry listener** | `registry_global` | Binds compositor, shm, layer_shell, output |
-| **Layer surface listener** | `layer_surface_configure` | Handles the configure/ack dance, creates buffer |
-| **Frame callback** | `frame_done`, `request_frame` | Animation loop driven by compositor |
-| **Cat AI** | `update_cat` | State machine with random transitions |
-| **Drawing** | `get_current_sprite`, `draw_frame`, `clear_rect` | Sprite selection, blit, damage tracking |
-| **SHM buffer** | `create_buffer` | `shm_open` → `mmap` → `wl_shm_pool` → `wl_buffer` |
-| **Entry point** | `main` | Wires everything together |
-
-### `protocols/wlr_layer_shell.odin` — hand-written Wayland bindings
-
-Provides two Wayland interfaces that aren't in the base `odin-wayland` package:
-
-| Interface | Purpose |
-|-----------|---------|
-| `zwlr_layer_shell_v1` | Factory — creates layer surfaces |
-| `zwlr_layer_surface_v1` | The surface itself — configure, ack, set size/anchor/etc |
-
----
-
-## Key Concepts
-
-### Why a global `State` struct?
-
-Wayland callbacks are C function pointers (`proc "c"`). They can't capture Odin closures or receive arbitrary context. The `data: rawptr` parameter exists but passing the whole state through it adds casts everywhere. A single global struct is the pragmatic choice (and what most C Wayland clients do).
-
-The `global_context` variable is needed because Odin's `context` (allocator, logger) isn't available in `proc "c"` — we save it at the start of `main()` and restore it in every callback with `context = global_context`.
-
-### The Wayland event lifecycle
-
-```
-1. main() creates surface, sets properties, calls commit()
-2. Compositor sends configure event (with screen dimensions)
-3. layer_surface_configure() acks, creates SHM buffer, draws first frame
-4. Requests a frame callback → commit()
-5. Compositor calls frame_done() when ready for next frame
-6. frame_done() updates cat, redraws, requests next callback → commit()
-7. Repeat 5-6 until signal or compositor closes surface
+```odin
+overlay.App :: struct {
+    title:      cstring,   // layer-shell namespace
+    tick_ms:    u32,       // animation tick interval (0 = every frame)
+    on_init:    proc(screen_w, screen_h: int) -> bool,
+    on_update:  proc(),    // called every tick_ms
+    on_draw:    proc(),    // called every frame (GL context current)
+    on_cleanup: proc(),    // called before teardown
+}
 ```
 
-The frame callback is **compositor-driven** — it fires when the compositor is ready to composite a new frame (typically 60Hz). The animation tick inside is timer-gated at 250ms to keep the cat movement speed independent of refresh rate.
-
-### SHM buffer (shared memory)
+### Lifecycle
 
 ```
-shm_open("/neko_shm_xxx")   → file descriptor
-ftruncate(fd, size)          → set file size = width × height × 4
-mmap(fd)                     → map into our address space → buf_data
-wl_shm_create_pool(fd)      → tell compositor about the shared memory
-wl_shm_pool_create_buffer() → carve a buffer from the pool
+overlay.run(app)
+  ├── install_signal_handlers()    ← SIGINT/SIGTERM → clean exit
+  ├── wl_display_connect()         ← connect to compositor
+  ├── registry → bind globals      ← compositor, layer_shell, output
+  ├── create wl_surface            ← the drawable surface
+  ├── set empty input region       ← click-through
+  ├── create layer_surface         ← fullscreen transparent overlay
+  ├── wl_surface.commit()          ← triggers configure event
+  │
+  │   configure event:
+  │   ├── init_egl()               ← EGL display/surface/context, GL 3.3 core
+  │   ├── app.on_init(w, h)        ← app loads textures, compiles shaders
+  │   ├── app.on_draw()            ← first frame
+  │   ├── request_frame()          ← register callback BEFORE commit
+  │   └── eglSwapBuffers()         ← presents frame (calls wl_surface_commit)
+  │
+  └── event loop
+        └── frame_done()           ← compositor-driven (~60fps)
+              ├── app.on_update()  ← every tick_ms
+              ├── app.on_draw()    ← every frame
+              ├── request_frame()  ← BEFORE swap
+              └── eglSwapBuffers() ← present + commit
 ```
 
-After this, `state.buf_data` and the compositor's view of the buffer are the **same memory**. Writing to `buf_data` + calling `commit()` is all that's needed to update the display.
+### Why a global state?
 
-Format is **ARGB8888 premultiplied** — each pixel is `(A<<24 | R<<16 | G<<8 | B)` where R,G,B are pre-multiplied by alpha: `R_out = R * A / 255`.
+Wayland callbacks are C function pointers (`proc "c"`). They can't capture Odin closures or receive arbitrary context. A single global struct in the overlay package is the pragmatic choice (and what most C Wayland clients do).
 
-### Chroma key (green screen removal)
+The `global_context` variable stores Odin's runtime context (allocator, logger) at startup. Every `proc "c"` callback restores it with `context = global_context`.
 
-The AI-generated sprites have bright green (#00FF00) backgrounds. During loading, each pixel's distance from pure green is computed. If `sqrt(dR² + dG² + dB²) < 80`, the pixel is made fully transparent. This is a simple approach that works well enough for the prototype sprites.
+### EGL Rendering Pipeline
 
-### The fullscreen overlay approach
+The framework creates a transparent GL context on the Wayland surface:
 
-Instead of a small surface that moves (layer-shell doesn't support arbitrary positioning), we create a **fullscreen transparent surface**:
+```
+wl_display → eglGetDisplay → eglInitialize
+           → eglChooseConfig (RGBA8, ALPHA_SIZE=8)
+           → wl_egl_window_create(wl_surface, w, h)
+           → eglCreateWindowSurface
+           → eglCreateContext (OpenGL 3.3 core)
+           → eglMakeCurrent
+           → gl.load_up_to(3, 3, eglGetProcAddress)
+```
+
+Key details:
+- **`EGL_ALPHA_SIZE = 8`** is critical — without it the overlay is opaque
+- **`eglSwapBuffers`** calls `wl_surface_commit()` internally — don't double-commit
+- **Frame callbacks** must be registered BEFORE `eglSwapBuffers` or they deadlock
+- **Premultiplied alpha**: Wayland expects premultiplied, so use `glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA)`
+
+### The Fullscreen Overlay Approach
+
+Instead of a small surface that moves (layer-shell doesn't support arbitrary positioning), the framework creates a fullscreen transparent surface:
 
 - `set_anchor({.top, .bottom, .left, .right})` — stretch to fill output
 - `set_size(0, 0)` — let compositor pick dimensions
 - `set_exclusive_zone(-1)` — don't push other windows
 - Empty input region — all clicks pass through
 
-The 1920×1080 buffer is ~8MB but we only write to the sprite-sized area each frame. Damage reporting tells the compositor which rectangles actually changed.
+### Signal Handling
 
-### Damage tracking
-
-Each frame, we report two damaged rectangles:
-1. **Previous position** — where the sprite was (now cleared to transparent)
-2. **Current position** — where the sprite is now
-
-This lets the compositor skip recompositing the ~99% of the surface that didn't change.
+SIGINT and SIGTERM set `ctx.running = false`. The event loop checks this flag each time `wl_display_dispatch` returns (which happens every frame thanks to the compositor-driven frame callback).
 
 ---
 
-## Cat State Machine
+## Neko App (`neko/`)
+
+The cat app implements the 4 overlay callbacks:
+
+### Sprites & Chroma Key
+
+AI-generated sprites have green (#00FF00) backgrounds. During `on_init`, each sprite is:
+1. Loaded via `stb_image`
+2. Scaled to 128×128
+3. Chroma keyed (pixels within distance 80 of pure green → transparent)
+4. Premultiplied (R,G,B multiplied by alpha)
+5. Uploaded to a GL texture via `glTexImage2D`
+
+### Cat State Machine
 
 ```
         ┌─────────┐
@@ -150,30 +152,29 @@ This lets the compositor skip recompositing the ~99% of the surface that didn't 
 - **t** = animation tick = 250ms
 - Walking moves `cat_x` by `WALK_SPEED * cat_dir` each tick
 - Bounces off screen edges (reverses `cat_dir`)
-- `get_current_sprite()` picks the sprite by state + direction
+- Sprite selected by state + direction
 
-### Adding new states
+### GL Rendering
 
-To add a new state (e.g. `Peeking`):
+Each frame:
+1. `glClear` with transparent black
+2. Bind the sprite texture for current state/direction
+3. Set `u_translate` uniform to `(cat_x, cat_y)`
+4. Draw a textured quad (two triangles)
+
+The vertex shader converts pixel coordinates to NDC using a `u_screen` uniform.
+
+### Adding New States
 
 1. Add to `Cat_State` enum
-2. Add a sprite field to `State` (e.g. `peek_frame: Sprite_Frame`)
-3. Load it in `load_all_sprites()`
-4. Add transition logic in `update_cat()`
-5. Add case in `get_current_sprite()`
-
-### Adding animation frames per state
-
-Currently each state has one sprite (walking has one per direction). To add multi-frame animation (e.g. 4-frame walk cycle):
-
-1. Change `walk_right: Sprite_Frame` → `walk_right: [4]Sprite_Frame`
-2. Load `walk_right_1.png` through `walk_right_4.png`
-3. In `get_current_sprite()`: `return &state.walk_right[state.anim_frame % 4]`
-4. Increment `anim_frame` in the Walking case of `update_cat()`
+2. Add a `Sprite_Frame` field to `Cat`
+3. Load it in `neko_init`
+4. Add transition logic in `neko_update`
+5. Add case in `neko_draw`
 
 ---
 
-## Extending the Bindings
+## Extending the Protocol Bindings
 
 `protocols/wlr_layer_shell.odin` follows the exact pattern that `wayland-scanner private-code` generates in C. If you need to add bindings for another protocol:
 
@@ -183,3 +184,17 @@ Currently each state has one sprite (walking has one per direction). To add mult
 4. Key rule: the message `signature` string and the `types` pointer offset must match exactly
 
 The signature characters: `i`=int, `u`=uint, `s`=string, `o`=object, `n`=new_id, `a`=array, `h`=fd, `f`=fixed. `?` before `o` means nullable. A digit prefix means "since version N".
+
+---
+
+## Writing a New App
+
+To create a new overlay app (e.g. matrix rain):
+
+1. Create `matrix/main.odin` with `package matrix`
+2. Import `ov "../overlay"` and `gl "vendor:OpenGL"`
+3. Implement `on_init`, `on_update`, `on_draw`, `on_cleanup`
+4. Call `ov.run({...})` in `main`
+5. Build with `./build.sh matrix run`
+
+The framework handles all Wayland, EGL, and lifecycle concerns. Your app only needs to make GL calls.

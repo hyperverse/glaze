@@ -1,5 +1,5 @@
 # Build output
-neko
+bin/
 
 # Odin build artifacts
 *.o
